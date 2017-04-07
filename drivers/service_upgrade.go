@@ -58,7 +58,6 @@ func (s *ServiceUpgradeDriver) Execute(conf interface{}, apiClient *client.Ranch
 		return http.StatusInternalServerError, errors.Wrap(err, "Couldn't unmarshal config")
 	}
 
-	requestedTag := config.Tag
 	if requestPayload == nil {
 		return http.StatusBadRequest, fmt.Errorf("No Payload recevied from Docker Hub webhook")
 	}
@@ -68,36 +67,99 @@ func (s *ServiceUpgradeDriver) Execute(conf interface{}, apiClient *client.Ranch
 		return http.StatusBadRequest, fmt.Errorf("Body should be of type map[string]interface{}")
 	}
 
-	pushedData, ok := requestBody["push_data"]
-	if !ok {
-		return http.StatusBadRequest, fmt.Errorf("Incomplete Docker Hub webhook response provided")
-	}
+  hubErr := HandleDockerHubResponse(&requestBody, config)
+  if hubEerr {
+    registryErr := HandleDockerRegistryV2Response(&requestBody, config)
+    if registryErr {
+      log.Errorf(hubErr)
+      log.Errorf(registryErr)
+      return http.StatusBadRequest, fmt.Errorf("Webhook response invalid or unsupported")
+    }
+  }
 
-	pushedTag, ok := pushedData.(map[string]interface{})["tag"].(string)
-	if !ok {
-		return http.StatusBadRequest, fmt.Errorf("Docker Hub webhook response contains no tag")
-	}
+	return http.StatusOK, nil
+}
 
-	repository, ok := requestBody["repository"]
-	if !ok {
-		return http.StatusBadRequest, fmt.Errorf("Docker Hub response provided without repository information")
-	}
+func HandleDockerHubResponse(body *map[string]interface{}, config *model.ServiceUpgrade) error {
+  pushedData, ok := body["push_data"]
+  if !ok {
+    return fmt.Errorf("Not a valid Docker Hub response")
+  }
 
-	imageName, ok := repository.(map[string]interface{})["repo_name"].(string)
-	if !ok {
-		return http.StatusBadRequest, fmt.Errorf("Docker Hub response provided without image name")
-	}
+  pushedTag, ok := pushedData.(map[string]interface{})["tag"].(string)
+  if !ok {
+    return fmt.Errorf("Docker Hub webhook response contains no tag")
+  }
+
+  repository, ok := body["repository"]
+  if !ok {
+    return fmt.Errorf("Docker Hub response provided without repository information")
+  }
+
+  imageName, ok := repository.(map[string]interface{})["repo_name"].(string)
+  if !ok {
+    return fmt.Errorf("Docker Hub response provided without image name")
+  }
 
 	pushedImage := imageName + ":" + pushedTag
-	if requestedTag != pushedTag {
-		return http.StatusOK, nil
+	if config.requestedTag != pushedTag {
+		return nil
 	}
 
 	log.Infof("Image %s pushed in Docker Hub, upgrading services with serviceSelector %v", pushedImage, config.ServiceSelector)
 
 	go upgradeServices(apiClient, config, pushedImage)
 
-	return http.StatusOK, nil
+  return nil
+}
+
+func HandleDockerRegistryV2Response(body *map[string]interface{}, config *model.ServiceUpgrade) error {
+  events, ok := body["events"]
+  if !ok {
+    return fmt.Errorf("Not a valid Docker Registry v2 response")
+  }
+
+  foundEvent := false
+  for idx, event := range events {
+    action, ok = event["action"]
+    if action != "push" || !ok {
+      continue
+    }
+
+    pushedTag, ok := event["tag"]
+    if !ok {
+      continue
+    }
+
+    target, ok := event["target"]
+    if !ok {
+      continue
+    }
+
+    pushedImage, ok := target["repository"]
+    if !ok {
+      continue
+    }
+
+    source, ok := event["source"]
+    if ok {
+      registryAddr, ok := source["addr"]
+      if !ok {
+        registryAddr = "[UNKNOWN]"
+      }
+    }
+
+    log.Infof("Image %s pushed to Docker Registry %s, upgrading services with serviceSelector %v", pushedImage, registryAddr, config.ServiceSelector)
+
+    foundEvent = foundEvent || true
+    go upgradeServices(apiClient, config, pushedImage)
+  }
+
+  if !foundEvent {
+    return fmt.Infof("No suitable event found in Docker Registry v2 response")
+  }
+
+  return nil
 }
 
 func upgradeServices(apiClient *client.RancherClient, config *model.ServiceUpgrade, pushedImage string) {
